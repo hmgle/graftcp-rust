@@ -1,5 +1,5 @@
 use graftcp_common::{Result, Config};
-use graftcp_common::fake_ip::{decode_from_loopback_simple, is_loopback_encoded};
+use graftcp_common::{resolve_loopback_ip, is_loopback_ip};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::net::{TcpListener, TcpStream};
@@ -18,24 +18,21 @@ impl ProxyServer {
     }
     
     /// Start the proxy server listening on all loopback addresses (127.0.0.0/8)
-    /// This replaces the traditional single-port listening approach
+    /// This replaces the traditional single-port listening approach  
     pub async fn start_loopback_listen(&self) -> Result<()> {
-        // For simplicity, we'll listen on 0.0.0.0:0 and let the OS assign a port
-        // In a full implementation, we'd need to use raw sockets or multiple listeners
-        // to truly capture all loopback traffic
-        
         info!("Starting loopback-aware proxy server...");
         
-        // Listen on all interfaces for now - in practice, applications will connect
-        // to specific loopback addresses that we've encoded
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        // Listen on 0.0.0.0 to receive connections to ANY IP on the specified port
+        // When graftcp redirects connect(real) to connect(loopback_ip:server_port),
+        // we'll receive the connection and can see which loopback_ip was used
+        let listen_addr = format!("0.0.0.0:{}", self.config.listen_addr.port());
+        let listener = TcpListener::bind(&listen_addr).await?;
         let actual_addr = listener.local_addr()?;
         
-        info!("graftcp-local listening on {} (loopback mode)", actual_addr);
-        info!("Note: In loopback mode, the actual listening address is less important");
-        info!("Applications will connect to encoded loopback addresses (127.x.x.x)");
+        info!("graftcp-local listening on {} (captures connections to any 127.x.x.x:{})", 
+              actual_addr, actual_addr.port());
         
-        // Create a dummy proxy client and process tracker for compatibility
+        // Create proxy client and process tracker
         let proxy_client = ProxyClient::new(
             self.config.socks5_addr,
             self.config.socks5_username.clone(),
@@ -108,52 +105,81 @@ impl ProxyServer {
         client_stream: TcpStream,
         remote_addr: std::net::SocketAddr,
         proxy_client: ProxyClient,
-        _process_tracker: Arc<RwLock<ProcessTracker>>, // No longer needed for loopback encoding!
+        _process_tracker: Arc<RwLock<ProcessTracker>>,
     ) -> Result<()> {
-        // Get local address for this connection - this is the encoded loopback address!
+        // Get local address for this connection
         let local_addr = client_stream.local_addr()?;
         
-        debug!("Handling connection: {} -> {}", remote_addr, local_addr);
+        info!("=== NEW CONNECTION ===");
+        info!("Remote (client): {}", remote_addr);
+        info!("Local (server):  {}", local_addr);
         
-        // SIMPLIFIED: Direct decoding from loopback address
-        // No FIFO communication, no PID tracking, no global state!
-        let dest_addr = if is_loopback_encoded(local_addr.ip()) {
-            // Decode the real destination directly from the loopback address
-            match decode_from_loopback_simple(local_addr) {
+        // Extract loopback IP from the local address
+        if let Some(loopback_ip) = Self::extract_loopback_ip(&local_addr) {
+            info!("✅ Extracted loopback IP: {}", loopback_ip);
+            
+            // Look up the real destination using the loopback IP
+            match resolve_loopback_ip(loopback_ip) {
                 Some(real_dest) => {
-                    info!("Decoded loopback {} to real destination {}", local_addr, real_dest);
-                    real_dest
+                    info!("✅ Resolved {} → {}", loopback_ip, real_dest);
+                    
+                    // Connect to the real destination through proxy
+                    let dest_stream = match proxy_client.connect(real_dest).await {
+                        Ok(stream) => {
+                            info!("✅ Connected to real destination: {}", real_dest);
+                            stream
+                        },
+                        Err(e) => {
+                            error!("❌ Failed to connect to destination {}: {}", real_dest, e);
+                            return Err(e);
+                        }
+                    };
+                    
+                    // Start relaying data between client and destination
+                    Self::relay_data(client_stream, dest_stream).await?;
+                    info!("✅ Connection relay completed for {}", real_dest);
                 }
                 None => {
-                    error!("Failed to decode loopback address: {}", local_addr);
+                    error!("❌ Failed to resolve loopback IP: {} (connection {}→{})", 
+                           loopback_ip, remote_addr, local_addr);
                     return Err(graftcp_common::GraftcpError::ProcessError(
-                        format!("Cannot decode loopback address: {}", local_addr)
+                        format!("Cannot resolve loopback IP: {}", loopback_ip)
                     ));
                 }
             }
         } else {
-            // Not a loopback encoded address - might be direct connection
-            warn!("Connection to non-encoded address: {} - treating as direct", local_addr);
-            local_addr
+            warn!("⚠️  Connection to non-loopback address: {} - this might be a direct connection or configuration issue", local_addr);
+            warn!("    If you see this frequently, check your graftcp configuration");
+            
+            // For debugging, let's still try to handle it as a direct connection
+            let dest_stream = match proxy_client.connect(local_addr).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    error!("❌ Failed to connect directly to {}: {}", local_addr, e);
+                    return Err(e);
+                }
+            };
+            
+            Self::relay_data(client_stream, dest_stream).await?;
         };
-        
-        info!("Final destination resolved: {} -> {}", local_addr, dest_addr);
-        
-        // Connect to the real destination through proxy
-        let dest_stream = match proxy_client.connect(dest_addr).await {
-            Ok(stream) => stream,
-            Err(e) => {
-                error!("Failed to connect to destination {}: {}", dest_addr, e);
-                return Err(e);
-            }
-        };
-        
-        info!("Successfully connected to destination {}", dest_addr);
-        
-        // Start relaying data between client and destination
-        Self::relay_data(client_stream, dest_stream).await?;
         
         Ok(())
+    }
+    
+    /// Extract loopback IP from local address if it's in the loopback range
+    fn extract_loopback_ip(addr: &std::net::SocketAddr) -> Option<std::net::Ipv4Addr> {
+        match addr.ip() {
+            std::net::IpAddr::V4(ipv4) => {
+                if is_loopback_ip(std::net::IpAddr::V4(ipv4)) {
+                    // Return the loopback IP regardless of whether it's 127.0.0.1 or others
+                    // The issue was excluding 127.0.0.1, but that might be a valid allocated IP
+                    Some(ipv4)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
     
     /// Relay data bidirectionally between two TCP streams

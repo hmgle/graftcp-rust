@@ -1,107 +1,156 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use lazy_static::lazy_static;
 
-/// Loopback address encoding for transparent proxying
-/// Uses 127.0.0.0/8 range where all addresses point to localhost
-/// This eliminates the need for mapping storage and FIFO communication
-const LOOPBACK_BASE: u8 = 127;
-
-/// Encode a real IPv4 address into a loopback address
-/// Maps real IP a.b.c.d to loopback address 127.a.b.c
-/// The port remains unchanged
-pub fn encode_to_loopback(real_addr: SocketAddr) -> SocketAddr {
-    match real_addr.ip() {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            let loopback_ip = Ipv4Addr::new(LOOPBACK_BASE, octets[0], octets[1], octets[2]);
-            SocketAddr::new(IpAddr::V4(loopback_ip), real_addr.port())
-        }
-        IpAddr::V6(_) => {
-            // For IPv6, we can't encode in loopback, fall back to localhost
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), real_addr.port())
-        }
-    }
+/// Loopback address generator that produces sequential unique loopback addresses
+/// Uses 127.0.0.1 to 127.255.255.254 range, cycling when exhausted
+#[derive(Debug)]
+pub struct LoopbackGenerator {
+    /// Current loopback IP as u32 (starts from 127.0.0.1)
+    current_ip: u32,
+    /// Mapping from loopback IP to real destination (IP:port)
+    loopback_to_target: HashMap<Ipv4Addr, SocketAddr>,
+    /// Reverse mapping for cleanup and deduplication
+    target_to_loopback: HashMap<SocketAddr, Ipv4Addr>,
 }
 
-/// Decode a loopback address back to the real IPv4 address
-/// Maps loopback address 127.a.b.c to real IP a.b.c.d (d=last_octet)
-/// For proper decoding, we need to store the last octet separately
-/// or use a different encoding scheme
-pub fn decode_from_loopback(loopback_addr: SocketAddr, last_octet: u8) -> Option<SocketAddr> {
-    match loopback_addr.ip() {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            if octets[0] == LOOPBACK_BASE {
-                // Reconstruct real IP: 127.a.b.c -> a.b.c.last_octet
-                let real_ip = Ipv4Addr::new(octets[1], octets[2], octets[3], last_octet);
-                Some(SocketAddr::new(IpAddr::V4(real_ip), loopback_addr.port()))
-            } else {
-                None
+/// Loopback IP range: 127.0.0.0/8
+const LOOPBACK_BASE: u32 = 0x7F000000; // 127.0.0.0
+const LOOPBACK_MASK: u32 = 0xFF000000; // /8 mask
+const LOOPBACK_START: u32 = 0x7F000001; // 127.0.0.1 (skip 127.0.0.0)
+const LOOPBACK_END: u32 = 0x7FFFFFFE;   // 127.255.255.254 (skip 127.255.255.255)
+
+impl LoopbackGenerator {
+    pub fn new() -> Self {
+        Self {
+            current_ip: LOOPBACK_START,
+            loopback_to_target: HashMap::new(),
+            target_to_loopback: HashMap::new(),
+        }
+    }
+
+    /// Allocate a unique loopback IP for the given target address
+    /// Returns existing loopback IP if target is already mapped
+    pub fn allocate_loopback(&mut self, target: SocketAddr) -> Result<Ipv4Addr, String> {
+        // Check if we already have a loopback IP for this target
+        if let Some(existing_loopback) = self.target_to_loopback.get(&target) {
+            return Ok(*existing_loopback);
+        }
+
+        // Find next available loopback IP
+        let start_ip = self.current_ip;
+        loop {
+            let loopback_ip = Ipv4Addr::from(self.current_ip);
+            
+            // Check if this IP is already in use
+            if !self.loopback_to_target.contains_key(&loopback_ip) {
+                // Found an available IP
+                self.loopback_to_target.insert(loopback_ip, target);
+                self.target_to_loopback.insert(target, loopback_ip);
+                
+                // Advance to next IP for future allocations
+                self.advance_current_ip();
+                
+                return Ok(loopback_ip);
+            }
+            
+            // Move to next IP and check for wraparound
+            self.advance_current_ip();
+            
+            // Check if we've cycled through all available IPs
+            if self.current_ip == start_ip {
+                return Err("All loopback addresses are in use".to_string());
             }
         }
-        _ => None,
     }
-}
 
-/// Enhanced encoding that preserves all 4 octets by using multiple loopback addresses
-/// This approach cycles through different loopback ranges to store the full IP
-pub fn encode_to_loopback_enhanced(real_addr: SocketAddr) -> Vec<SocketAddr> {
-    match real_addr.ip() {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            // Store IP a.b.c.d as two loopback addresses:
-            // 127.a.b.c (primary) and 127.0.0.d (secondary for last octet)
-            vec![
-                SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(LOOPBACK_BASE, octets[0], octets[1], octets[2])),
-                    real_addr.port()
-                ),
-                SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(LOOPBACK_BASE, 0, 0, octets[3])),
-                    real_addr.port()
-                ),
-            ]
-        }
-        IpAddr::V6(_) => {
-            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), real_addr.port())]
-        }
+    /// Resolve a loopback IP back to the original target address
+    pub fn resolve_loopback(&self, loopback_ip: Ipv4Addr) -> Option<SocketAddr> {
+        self.loopback_to_target.get(&loopback_ip).copied()
     }
-}
 
-/// Simple encoding scheme that works for most cases
-/// Encodes IP a.b.c.d as 127.a.b.c, losing the last octet
-/// This works well when the last octet is not critical (e.g., well-known services)
-pub fn encode_to_loopback_simple(real_addr: SocketAddr) -> SocketAddr {
-    encode_to_loopback(real_addr)
-}
-
-/// Decode from simple loopback encoding
-/// Assumes last octet is predictable (e.g., 0 for many services)
-pub fn decode_from_loopback_simple(loopback_addr: SocketAddr) -> Option<SocketAddr> {
-    match loopback_addr.ip() {
-        IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            if octets[0] == LOOPBACK_BASE && octets[1] != 0 {
-                // Common heuristic: use .1 as default last octet for unknown services
-                // For well-known services, this can be refined
-                let real_ip = match loopback_addr.port() {
-                    80 | 443 | 8080 => Ipv4Addr::new(octets[1], octets[2], octets[3], 1),
-                    _ => Ipv4Addr::new(octets[1], octets[2], octets[3], 1),
-                };
-                Some(SocketAddr::new(IpAddr::V4(real_ip), loopback_addr.port()))
-            } else {
-                None
+    /// Check if an IP is in the loopback range (127.0.0.0/8)
+    pub fn is_loopback(&self, ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                let ip_u32 = u32::from(ipv4);
+                (ip_u32 & LOOPBACK_MASK) == LOOPBACK_BASE
             }
+            IpAddr::V6(_) => false,
         }
-        _ => None,
+    }
+
+    /// Release a loopback IP mapping (for cleanup)
+    pub fn release_loopback(&mut self, loopback_ip: Ipv4Addr) -> bool {
+        if let Some(target) = self.loopback_to_target.remove(&loopback_ip) {
+            self.target_to_loopback.remove(&target);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get current usage statistics
+    pub fn stats(&self) -> (usize, u32) {
+        (self.loopback_to_target.len(), self.current_ip - LOOPBACK_START)
+    }
+
+    /// Advance current IP to next available address
+    fn advance_current_ip(&mut self) {
+        self.current_ip += 1;
+        if self.current_ip > LOOPBACK_END {
+            self.current_ip = LOOPBACK_START; // Wrap around
+        }
     }
 }
 
-/// Check if an IP address is in the loopback range (127.0.0.0/8)
-pub fn is_loopback_encoded(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ipv4) => ipv4.octets()[0] == LOOPBACK_BASE,
-        IpAddr::V6(_) => false,
-    }
+/// Global instance of the loopback generator
+lazy_static! {
+    pub static ref GLOBAL_LOOPBACK_GENERATOR: Arc<Mutex<LoopbackGenerator>> = 
+        Arc::new(Mutex::new(LoopbackGenerator::new()));
+}
+
+/// Convenience functions for global access
+
+/// Allocate a loopback IP for a target address
+pub fn allocate_loopback_ip(target: SocketAddr) -> Result<Ipv4Addr, String> {
+    GLOBAL_LOOPBACK_GENERATOR
+        .lock()
+        .map_err(|e| format!("Failed to lock loopback generator: {}", e))?
+        .allocate_loopback(target)
+}
+
+/// Resolve a loopback IP to target address
+pub fn resolve_loopback_ip(loopback_ip: Ipv4Addr) -> Option<SocketAddr> {
+    GLOBAL_LOOPBACK_GENERATOR
+        .lock()
+        .ok()?
+        .resolve_loopback(loopback_ip)
+}
+
+/// Check if an IP is a loopback IP
+pub fn is_loopback_ip(ip: IpAddr) -> bool {
+    GLOBAL_LOOPBACK_GENERATOR
+        .lock()
+        .map(|generator| generator.is_loopback(ip))
+        .unwrap_or(false)
+}
+
+/// Release a loopback IP mapping
+pub fn release_loopback_ip(loopback_ip: Ipv4Addr) -> bool {
+    GLOBAL_LOOPBACK_GENERATOR
+        .lock()
+        .map(|mut generator| generator.release_loopback(loopback_ip))
+        .unwrap_or(false)
+}
+
+/// Get usage statistics
+pub fn get_loopback_stats() -> (usize, u32) {
+    GLOBAL_LOOPBACK_GENERATOR
+        .lock()
+        .map(|generator| generator.stats())
+        .unwrap_or((0, 0))
 }
 
 #[cfg(test)]
@@ -109,99 +158,129 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_loopback_encoding() {
-        let real_addr: SocketAddr = "93.184.216.34:80".parse().unwrap();
-        let loopback_addr = encode_to_loopback_simple(real_addr);
+    fn test_loopback_generator_basic() {
+        let mut generator = LoopbackGenerator::new();
         
-        // Should be encoded as 127.93.184.216:80
-        assert_eq!(loopback_addr.ip().to_string(), "127.93.184.216");
-        assert_eq!(loopback_addr.port(), 80);
+        let target = "93.184.216.34:80".parse().unwrap();
+        let loopback_ip = generator.allocate_loopback(target).unwrap();
         
-        // Should be identified as loopback encoded
-        assert!(is_loopback_encoded(loopback_addr.ip()));
+        // Should be in loopback range
+        assert!(generator.is_loopback(IpAddr::V4(loopback_ip)));
+        
+        // Should resolve back to original
+        assert_eq!(generator.resolve_loopback(loopback_ip), Some(target));
     }
 
     #[test]
-    fn test_loopback_decoding() {
-        let loopback_addr: SocketAddr = "127.93.184.216:80".parse().unwrap();
-        let decoded_addr = decode_from_loopback_simple(loopback_addr);
+    fn test_sequential_allocation() {
+        let mut generator = LoopbackGenerator::new();
         
-        // Should decode to 93.184.216.1:80 (note: last octet is heuristic)
-        assert!(decoded_addr.is_some());
-        let decoded = decoded_addr.unwrap();
-        assert_eq!(decoded.ip().to_string(), "93.184.216.1");
-        assert_eq!(decoded.port(), 80);
+        let target1 = "1.2.3.4:80".parse().unwrap();
+        let target2 = "5.6.7.8:443".parse().unwrap();
+        
+        let loopback1 = generator.allocate_loopback(target1).unwrap();
+        let loopback2 = generator.allocate_loopback(target2).unwrap();
+        
+        // Should be different IPs
+        assert_ne!(loopback1, loopback2);
+        
+        // Should resolve correctly
+        assert_eq!(generator.resolve_loopback(loopback1), Some(target1));
+        assert_eq!(generator.resolve_loopback(loopback2), Some(target2));
+        
+        // Sequential IPs
+        assert_eq!(u32::from(loopback2), u32::from(loopback1) + 1);
     }
 
     #[test]
-    fn test_loopback_range_detection() {
-        // Test loopback encoded addresses
-        assert!(is_loopback_encoded("127.1.2.3".parse().unwrap()));
-        assert!(is_loopback_encoded("127.255.255.255".parse().unwrap()));
-        assert!(is_loopback_encoded("127.0.0.1".parse().unwrap()));
+    fn test_duplicate_target_reuses_loopback() {
+        let mut generator = LoopbackGenerator::new();
         
-        // Test non-loopback addresses
-        assert!(!is_loopback_encoded("192.168.1.1".parse().unwrap()));
-        assert!(!is_loopback_encoded("8.8.8.8".parse().unwrap()));
-        assert!(!is_loopback_encoded("198.19.0.1".parse().unwrap()));
+        let target = "93.184.216.34:80".parse().unwrap();
+        let loopback1 = generator.allocate_loopback(target).unwrap();
+        let loopback2 = generator.allocate_loopback(target).unwrap();
+        
+        // Should return the same loopback IP for the same target
+        assert_eq!(loopback1, loopback2);
     }
 
     #[test]
-    fn test_enhanced_encoding() {
-        let real_addr: SocketAddr = "93.184.216.34:443".parse().unwrap();
-        let encoded_addrs = encode_to_loopback_enhanced(real_addr);
+    fn test_loopback_range() {
+        let generator = LoopbackGenerator::new();
         
-        assert_eq!(encoded_addrs.len(), 2);
-        
-        // Primary: 127.93.184.216:443
-        assert_eq!(encoded_addrs[0].ip().to_string(), "127.93.184.216");
-        assert_eq!(encoded_addrs[0].port(), 443);
-        
-        // Secondary: 127.0.0.34:443 (stores last octet)
-        assert_eq!(encoded_addrs[1].ip().to_string(), "127.0.0.34");
-        assert_eq!(encoded_addrs[1].port(), 443);
+        // Test loopback IP detection
+        assert!(generator.is_loopback("127.0.0.1".parse().unwrap()));
+        assert!(generator.is_loopback("127.1.2.3".parse().unwrap()));
+        assert!(generator.is_loopback("127.255.255.255".parse().unwrap()));
+        assert!(!generator.is_loopback("192.168.1.1".parse().unwrap()));
+        assert!(!generator.is_loopback("8.8.8.8".parse().unwrap()));
     }
 
     #[test]
-    fn test_ipv6_fallback() {
-        let ipv6_addr: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
-        let encoded = encode_to_loopback_simple(ipv6_addr);
+    fn test_release_loopback() {
+        let mut generator = LoopbackGenerator::new();
         
-        // Should fall back to localhost
-        assert_eq!(encoded.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(encoded.port(), 80);
+        let target = "93.184.216.34:80".parse().unwrap();
+        let loopback_ip = generator.allocate_loopback(target).unwrap();
+        
+        // Should resolve initially
+        assert_eq!(generator.resolve_loopback(loopback_ip), Some(target));
+        
+        // Release the mapping
+        assert!(generator.release_loopback(loopback_ip));
+        
+        // Should no longer resolve
+        assert_eq!(generator.resolve_loopback(loopback_ip), None);
+        
+        // Can't release again
+        assert!(!generator.release_loopback(loopback_ip));
     }
 
     #[test]
-    fn test_roundtrip_common_addresses() {
-        let test_addresses = vec![
-            "8.8.8.8:53",           // Google DNS
-            "1.1.1.1:53",           // Cloudflare DNS
-            "93.184.216.34:80",     // example.com
-            "172.16.0.1:22",        // Private network
-            "10.0.0.1:3306",        // MySQL
-        ];
+    fn test_global_functions() {
+        let target = "8.8.8.8:53".parse().unwrap();
         
-        for addr_str in test_addresses {
-            let real_addr: SocketAddr = addr_str.parse().unwrap();
-            let encoded = encode_to_loopback_simple(real_addr);
-            let decoded = decode_from_loopback_simple(encoded);
-            
-            assert!(decoded.is_some(), "Failed to decode {}", addr_str);
-            let decoded = decoded.unwrap();
-            
-            // Check that the first 3 octets match
-            let real_ip = real_addr.ip().to_string();
-            let decoded_ip = decoded.ip().to_string();
-            let real_parts: Vec<&str> = real_ip.split('.').collect();
-            let decoded_parts: Vec<&str> = decoded_ip.split('.').collect();
-            
-            assert_eq!(real_parts[0], decoded_parts[0]);
-            assert_eq!(real_parts[1], decoded_parts[1]);
-            assert_eq!(real_parts[2], decoded_parts[2]);
-            // Note: last octet may differ due to heuristic
-            
-            assert_eq!(real_addr.port(), decoded.port());
-        }
+        // Allocate via global function
+        let loopback_ip = allocate_loopback_ip(target).unwrap();
+        
+        // Should be in loopback range
+        assert!(is_loopback_ip(IpAddr::V4(loopback_ip)));
+        
+        // Should resolve via global function
+        assert_eq!(resolve_loopback_ip(loopback_ip), Some(target));
+        
+        // Check stats
+        let (count, _) = get_loopback_stats();
+        assert!(count >= 1);
+        
+        // Release via global function
+        assert!(release_loopback_ip(loopback_ip));
+        assert_eq!(resolve_loopback_ip(loopback_ip), None);
+    }
+
+    #[test]
+    fn test_wraparound_behavior() {
+        let mut generator = LoopbackGenerator::new();
+        
+        // Test that current_ip wraps around correctly
+        generator.current_ip = LOOPBACK_END;
+        generator.advance_current_ip();
+        assert_eq!(generator.current_ip, LOOPBACK_START);
+    }
+
+    #[test]
+    fn test_first_loopback_allocation() {
+        let mut generator = LoopbackGenerator::new();
+        let target = "1.2.3.4:80".parse().unwrap();
+        
+        let loopback_ip = generator.allocate_loopback(target).unwrap();
+        
+        // First allocation should be 127.0.0.1
+        assert_eq!(loopback_ip, Ipv4Addr::new(127, 0, 0, 1));
+        
+        // Next allocation should be 127.0.0.2
+        let target2 = "5.6.7.8:80".parse().unwrap();
+        let loopback_ip2 = generator.allocate_loopback(target2).unwrap();
+        assert_eq!(loopback_ip2, Ipv4Addr::new(127, 0, 0, 2));
     }
 }
