@@ -45,7 +45,6 @@ pub struct Config {
     pub socks5_username: Option<String>,
     pub socks5_password: Option<String>,
     pub http_proxy_addr: Option<SocketAddr>,
-    pub pipe_path: String,
     pub proxy_mode: ProxyMode,
     pub blacklist_ips: Vec<IpAddr>,
     pub whitelist_ips: Vec<IpAddr>,
@@ -60,7 +59,7 @@ impl Default for Config {
             socks5_username: None,
             socks5_password: None,
             http_proxy_addr: None,
-            pipe_path: "/tmp/graftcplocal.fifo".to_string(),
+            
             proxy_mode: ProxyMode::Auto,
             blacklist_ips: Vec::new(),
             whitelist_ips: Vec::new(),

@@ -1,5 +1,5 @@
 use crate::ptrace::PtraceManager;
-use crate::fifo::FifoManager;
+
 use graftcp_common::{Result, ProcessInfo, SocketInfo};
 use graftcp_common::{allocate_loopback_ip, is_loopback_ip};
 use nix::sys::wait::WaitStatus;
@@ -25,21 +25,19 @@ pub struct Tracer {
     local_addr: String,
     local_port: u16,
     ignore_local: bool,
-    fifo_manager: FifoManager,
     /// Storage for original connect() arguments during syscall hook
     /// Key: PID, Value: (original_addr_ptr, original_addr_data, allocated_loopback_ip)
     pending_connects: HashMap<u32, (u64, Vec<u8>, Ipv4Addr)>,
 }
 
 impl Tracer {
-    pub fn new(local_addr: String, local_port: u16, ignore_local: bool, fifo_path: String) -> Self {
+    pub fn new(local_addr: String, local_port: u16, ignore_local: bool) -> Self {
         Self {
             process_info: HashMap::new(),
             socket_info: HashMap::new(),
             local_addr,
             local_port,
             ignore_local,
-            fifo_manager: FifoManager::new(fifo_path),
             pending_connects: HashMap::new(),
         }
     }

@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, error, warn, debug};
 use crate::proxy::ProxyClient;
-use crate::proc_tracker::ProcessTracker;
+
 
 /// Server that handles incoming connections and forwards them through proxies
 pub struct ProxyServer {
@@ -32,7 +32,6 @@ impl ProxyServer {
         info!("graftcp-local listening on {} (captures connections to any 127.x.x.x:{})", 
               actual_addr, actual_addr.port());
         
-        // Create proxy client and process tracker
         let proxy_client = ProxyClient::new(
             self.config.socks5_addr,
             self.config.socks5_username.clone(),
@@ -41,9 +40,7 @@ impl ProxyServer {
             self.config.proxy_mode.clone(),
         )?;
         
-        let process_tracker = Arc::new(RwLock::new(ProcessTracker::new()));
-        
-        self.start_with_listener(listener, proxy_client, process_tracker).await
+        self.start_with_listener(listener, proxy_client).await
     }
     
     /// Start the proxy server and return the actual listening address
@@ -58,10 +55,9 @@ impl ProxyServer {
     pub async fn start(
         &self,
         _proxy_client: ProxyClient,
-        process_tracker: Arc<RwLock<ProcessTracker>>,
     ) -> Result<()> {
         let (listener, _actual_addr) = self.start_listen().await?;
-        self.start_with_listener(listener, _proxy_client, process_tracker).await
+        self.start_with_listener(listener, _proxy_client).await
     }
     
     /// Start the proxy server with a pre-created listener
@@ -69,7 +65,6 @@ impl ProxyServer {
         &self,
         listener: TcpListener,
         _proxy_client: ProxyClient,
-        process_tracker: Arc<RwLock<ProcessTracker>>,
     ) -> Result<()> {
         // Accept incoming connections
         loop {
@@ -85,10 +80,8 @@ impl ProxyServer {
                         self.config.proxy_mode.clone(),
                     )?;
                     
-                    let process_tracker = process_tracker.clone();
-                    
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, remote_addr, proxy_client, process_tracker).await {
+                        if let Err(e) = Self::handle_connection(stream, remote_addr, proxy_client).await {
                             error!("Error handling connection: {}", e);
                         }
                     });
@@ -105,7 +98,6 @@ impl ProxyServer {
         client_stream: TcpStream,
         remote_addr: std::net::SocketAddr,
         proxy_client: ProxyClient,
-        _process_tracker: Arc<RwLock<ProcessTracker>>,
     ) -> Result<()> {
         // Get local address for this connection
         let local_addr = client_stream.local_addr()?;

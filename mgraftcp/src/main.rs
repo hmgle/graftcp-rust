@@ -6,14 +6,10 @@ use std::net::SocketAddr;
 use tracing::{info, error, debug};
 use tokio::sync::RwLock;
 use tempfile::TempDir;
-use nix::sys::stat::Mode;
-use nix::unistd::mkfifo;
 
 // Import local modules
 use graftcp_local::server::ProxyServer;
-use graftcp_local::proc_tracker::ProcessTracker;
 use graftcp_local::proxy::ProxyClient;
-use graftcp_local::fifo::start_fifo_reader;
 
 /// mgraftcp - combined graftcp and graftcp-local in single binary
 #[derive(Parser, Debug)]
@@ -70,7 +66,7 @@ pub struct Args {
 
 impl Args {
     /// Convert arguments to graftcp-local Config
-    fn to_config(&self, listen_addr: SocketAddr, fifo_path: String) -> Result<Config> {
+    fn to_config(&self, listen_addr: SocketAddr) -> Result<Config> {
         let proxy_mode = match self.select_proxy_mode.as_str() {
             "auto" => ProxyMode::Auto,
             "random" => ProxyMode::Random,
@@ -98,7 +94,6 @@ impl Args {
             socks5_username: self.socks5_username.clone(),
             socks5_password: self.socks5_password.clone(),
             http_proxy_addr,
-            pipe_path: fifo_path,
             proxy_mode,
             blacklist_ips: Vec::new(), // TODO: load from file
             whitelist_ips: Vec::new(), // TODO: load from file  
@@ -132,29 +127,13 @@ async fn main() -> Result<()> {
     if let Some(ref program) = args.program {
         info!("Executing: {} {:?}", program, args.args);
         
-        // Create temporary directory and FIFO
-        let temp_dir = TempDir::new().map_err(|e| {
-            graftcp_common::GraftcpError::ProcessError(format!("Failed to create temp dir: {}", e))
-        })?;
-        
-        let fifo_path = temp_dir.path().join("mgraftcp.fifo");
-        let fifo_path_str = fifo_path.to_string_lossy().to_string();
-        
-        // Create FIFO pipe
-        mkfifo(&fifo_path, Mode::from_bits_truncate(0o666)).map_err(|e| {
-            graftcp_common::GraftcpError::ProcessError(format!("Failed to create FIFO: {}", e))
-        })?;
-        
-        debug!("Created FIFO at: {}", fifo_path_str);
-        
         // Start embedded graftcp-local server
         let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap(); // Use ephemeral port
-        let config = args.to_config(listen_addr, fifo_path_str.clone())?;
+        let config = args.to_config(listen_addr)?;
         
         info!("Starting embedded graftcp-local with config: {:?}", config);
         
         // Initialize components
-        let process_tracker = Arc::new(RwLock::new(ProcessTracker::new()));
         let proxy_client = ProxyClient::new(
             config.socks5_addr,
             config.socks5_username.clone(),
@@ -162,15 +141,6 @@ async fn main() -> Result<()> {
             config.http_proxy_addr,
             config.proxy_mode.clone(),
         )?;
-        
-        // Start FIFO reader for process tracking
-        let process_tracker_clone = process_tracker.clone();
-        let fifo_path_for_reader = fifo_path_str.clone();
-        tokio::spawn(async move {
-            if let Err(e) = start_fifo_reader(&fifo_path_for_reader, process_tracker_clone).await {
-                error!("FIFO reader error: {}", e);
-            }
-        });
         
         // Start proxy server and get actual listening address
         let server = ProxyServer::new(config.clone());
@@ -180,9 +150,8 @@ async fn main() -> Result<()> {
         info!("graftcp-local is listening on actual address: {}", actual_addr);
         
         // Start the server with the listener
-        let process_tracker_clone = process_tracker.clone();
         let server_handle = tokio::spawn(async move {
-            if let Err(e) = server.start_with_listener(listener, proxy_client, process_tracker_clone).await {
+            if let Err(e) = server.start_with_listener(listener, proxy_client).await {
                 error!("Proxy server error: {}", e);
             }
         });
@@ -192,7 +161,6 @@ async fn main() -> Result<()> {
             program.clone(),
             args.args.clone(),
             actual_port,
-            fifo_path_str,
             args.blackip_file.clone(),
             args.whiteip_file.clone(),
             args.not_ignore_local,
@@ -236,28 +204,21 @@ async fn start_graftcp_tracer(
     program: String,
     program_args: Vec<String>,
     local_port: u16,
-    fifo_path: String,
     blackip_file: Option<PathBuf>,
     whiteip_file: Option<PathBuf>,
     not_ignore_local: bool,
 ) -> Result<i32> {
     use graftcp::tracer::Tracer;
-    use graftcp::fifo::FifoManager;
     
     info!("Starting graftcp tracer for program: {}", program);
     debug!("Arguments: {:?}", program_args);
     debug!("Local port: {}", local_port);
-    debug!("FIFO path: {}", fifo_path);
-    
-    // Create FIFO manager for sending destination info (currently unused)
-    let _fifo_manager = FifoManager::new(fifo_path.clone());
     
     // Create tracer with configuration
     let mut tracer = Tracer::new(
         "127.0.0.1".to_string(),
         local_port,
         !not_ignore_local, // ignore_local is opposite of not_ignore_local
-        fifo_path,
     );
     
     // TODO: Load blacklist/whitelist files if provided
