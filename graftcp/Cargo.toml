@@ -6,11 +6,7 @@ license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Main graftcp binary for process tracing and connection redirection"
-
-[[bin]]
-name = "graftcp"
-path = "src/main.rs"
+description = "Library for process tracing and connection redirection"
 
 [lib]
 name = "graftcp"

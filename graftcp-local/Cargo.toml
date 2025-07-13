@@ -6,11 +6,7 @@ license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
-description = "Local proxy server component for graftcp"
-
-[[bin]]
-name = "graftcp-local"
-path = "src/main.rs"
+description = "Library for the local proxy server component of graftcp"
 
 [lib]
 name = "graftcp_local"

@@ -8,12 +8,12 @@ Rust implementation of [graftcp](https://github.com/hmgle/graftcp) - a flexible 
 
 ## Architecture
 
-This project consists of four main components:
+This project consists of three main components:
 
-- **graftcp-common** - Shared types, error handling, and configuration
-- **graftcp** - Main binary that uses ptrace to intercept and redirect connections
-- **graftcp-local** - Local proxy server that forwards connections to SOCKS5/HTTP proxies
-- **mgraftcp** - Combined binary with both graftcp and graftcp-local functionality
+- **graftcp-common** - Shared types, error handling, and configuration.
+- **graftcp** - A library that uses ptrace to intercept and redirect connections.
+- **graftcp-local** - A library that provides the local proxy server to forward connections.
+- **mgraftcp** - The main binary that combines the tracer and proxy functionality.
 
 ## Building
 
@@ -25,13 +25,8 @@ This project consists of four main components:
 ### Build Commands
 
 ```bash
-# Build all components
+# Build the mgraftcp binary
 make build
-
-# Build specific components
-make graftcp
-make graftcp-local
-make mgraftcp
 
 # Development build
 make dev
@@ -60,30 +55,8 @@ make dev-check
 
 **Note: The Rust implementation is not yet functional. Refer to the original C/Go implementation for working software.**
 
-### graftcp
-
 ```bash
-# Redirect a program's connections through proxy
-./target/release/graftcp <program> [args...]
-
-# With custom configuration
-./target/release/graftcp -c config.toml curl https://example.com
-```
-
-### graftcp-local
-
-```bash
-# Start local proxy server
-./target/release/graftcp-local
-
-# With custom settings
-./target/release/graftcp-local --socks5 127.0.0.1:1080 --listen :2233
-```
-
-### mgraftcp
-
-```bash
-# Combined functionality in single binary
+# Use mgraftcp to redirect a program's connections through a proxy
 ./target/release/mgraftcp curl https://example.com
 ```
 

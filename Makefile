@@ -5,18 +5,8 @@
 # Default target
 all: build
 
-# Build all binaries
+# Build the mgraftcp binary
 build:
-	cargo build --release
-
-# Build specific binaries
-graftcp:
-	cargo build --release --bin graftcp
-
-graftcp-local:
-	cargo build --release --bin graftcp-local
-
-mgraftcp:
 	cargo build --release --bin mgraftcp
 
 # Development build (debug mode)
@@ -27,10 +17,8 @@ dev:
 clean:
 	cargo clean
 
-# Install binaries to system
+# Install binary to system
 install: build
-	install -D target/release/graftcp $(DESTDIR)$(PREFIX)/bin/graftcp
-	install -D target/release/graftcp-local $(DESTDIR)$(PREFIX)/bin/graftcp-local
 	install -D target/release/mgraftcp $(DESTDIR)$(PREFIX)/bin/mgraftcp
 
 # Run tests
