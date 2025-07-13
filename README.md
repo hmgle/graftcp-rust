@@ -2,6 +2,9 @@
 
 A Rust implementation of [graftcp](https://github.com/hmgle/graftcp) - a flexible tool that redirects TCP connections made by any given program to a SOCKS5 or HTTP proxy.
 
+> [!WARNING]
+> This project is a **Work in Progress**. While the core functionality is operational, it is still under active development and may contain bugs or incomplete features.
+
 This version consolidates all functionality into a single, efficient binary (`mgraftcp`).
 
 ## Architecture
@@ -70,10 +73,10 @@ RUST_LOG=info ./target/release/mgraftcp --socks5 192.168.1.100:1080 curl -v http
 - [x] **Dynamic IP Allocation**: Allocates unique loopback IPs (`127.0.0.x`) to track different destination addresses.
 - [x] **SOCKS5 Proxy Client**: Support for SOCKS5 with and without username/password authentication.
 - [x] **Connection Forwarding**: Data is relayed bidirectionally between the client and the real destination.
+- [x] **Removed FIFO**: The legacy FIFO communication mechanism has been removed in favor of the loopback IP strategy.
 
 ### In Progress
 - [ ] **HTTP Proxy Client**: Basic HTTP CONNECT support is implemented but needs more robust error handling and header parsing.
-- [ ] **FIFO Communication**: The mechanism for communication between the tracer and the local proxy is in place but not fully utilized for advanced tracking.
 - [ ] **IP Filtering**: Blacklist/whitelist functionality is planned but not yet implemented.
 
 ### TODO
