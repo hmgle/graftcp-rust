@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
         debug!("Created FIFO at: {}", fifo_path_str);
         
         // Start embedded graftcp-local server
-        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap(); // Use ephemeral port
+        let listen_addr: SocketAddr = "0.0.0.0:0".parse().unwrap(); // Use ephemeral port
         let config = args.to_config(listen_addr, fifo_path_str.clone())?;
         
         info!("Starting embedded graftcp-local with config: {:?}", config);
