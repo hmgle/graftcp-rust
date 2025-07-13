@@ -23,6 +23,9 @@ pub enum GraftcpError {
     
     #[error("address parse error: {0}")]
     AddrParseError(#[from] std::net::AddrParseError),
+    
+    #[error("seccomp BPF error: {0}")]
+    SeccompError(String),
 }
 
 pub type Result<T> = std::result::Result<T, GraftcpError>;
