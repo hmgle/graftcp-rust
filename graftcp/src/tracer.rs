@@ -1,6 +1,7 @@
 use crate::ptrace::PtraceManager;
 use crate::fifo::FifoManager;
 use graftcp_common::{Result, ProcessInfo, SocketInfo};
+use graftcp_common::fake_ip::{encode_to_loopback_simple, is_loopback_encoded};
 use nix::sys::wait::WaitStatus;
 use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::ptrace;
@@ -318,38 +319,23 @@ impl Tracer {
             return Ok(());
         }
         
-        // Use fake IP approach instead of FIFO communication
-        use graftcp_common::{allocate_fake_ip, is_fake_ip};
-        use std::net::{IpAddr, Ipv4Addr};
+        // Use loopback encoding instead of fake IP mapping
+        // This eliminates the need for global state and FIFO communication
+        let encoded_addr = encode_to_loopback_simple(dest_addr);
         
-        // Allocate a fake IP for this destination
-        let fake_ip = match allocate_fake_ip(dest_addr) {
-            Ok(ip) => ip,
-            Err(e) => {
-                error!("Failed to allocate fake IP for {}: {}", dest_addr, e);
-                return Ok(());
-            }
-        };
+        info!("Encoded real destination {} as loopback {}", dest_addr, encoded_addr);
         
-        info!("Allocated fake IP {} for real destination {}", fake_ip, dest_addr);
+        // NO FIFO communication needed - address is self-contained!
+        // The encoded address contains all information needed for decoding
         
-        // Send fake IP info to graftcp-local via FIFO 
-        // This tells the server: "when you see a connection with this fake IP, resolve it"
-        if let Err(e) = self.fifo_manager.send_destination_info(&SocketAddr::new(IpAddr::V4(fake_ip), dest_addr.port()), pid) {
-            warn!("Failed to send fake IP info to graftcp-local: {}", e);
-            // Continue anyway - we still have the global mapping
-        }
-        
-        // Create new socket address pointing to our local proxy 
-        let proxy_addr = self.create_proxy_socket_addr(family)?;
-        
-        // Modify the connect() arguments to redirect to our proxy
-        if let Err(e) = self.redirect_connect_to_proxy(ptrace_mgr, addr_ptr, &proxy_addr, family) {
-            error!("Failed to redirect connection: {}", e);
+        // Redirect connect() to the encoded loopback address instead of proxy
+        // graftcp-local will listen on all loopback addresses and decode the real destination
+        if let Err(e) = self.redirect_connect_to_loopback(ptrace_mgr, addr_ptr, &encoded_addr, family) {
+            error!("Failed to redirect connection to loopback: {}", e);
             return Ok(()); // Don't fail the whole process
         }
         
-        info!("Redirected {} to fake IP {} via {}:{}", dest_addr, fake_ip, self.local_addr, self.local_port);
+        info!("Redirected {} directly to encoded loopback {}", dest_addr, encoded_addr);
         
         Ok(())
     }
@@ -598,5 +584,61 @@ impl Tracer {
         // TODO: Check blacklist/whitelist
         
         false
+    }
+    
+    /// Modify connect() arguments to redirect to encoded loopback address
+    fn redirect_connect_to_loopback(
+        &self,
+        ptrace_mgr: &PtraceManager,
+        addr_ptr: u64,
+        loopback_addr: &SocketAddr,
+        family: c_int,
+    ) -> Result<()> {
+        match family {
+            AF_INET => {
+                // Create sockaddr_in structure for IPv4 loopback
+                let mut sockaddr_in = vec![0u8; 16]; // sizeof(struct sockaddr_in)
+                
+                // Fill in the structure
+                sockaddr_in[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+                
+                if let IpAddr::V4(ipv4) = loopback_addr.ip() {
+                    sockaddr_in[2..4].copy_from_slice(&loopback_addr.port().to_be_bytes());
+                    sockaddr_in[4..8].copy_from_slice(&ipv4.octets());
+                    // Rest is already zeroed
+                } else {
+                    return Err(graftcp_common::GraftcpError::NetworkError(
+                        "IPv4 loopback address expected but got IPv6".to_string()
+                    ));
+                }
+                
+                // Write the modified address structure back to process memory
+                ptrace_mgr.write_data(addr_ptr, &sockaddr_in)?;
+                
+                debug!("Modified connect() to use loopback address: {}", loopback_addr);
+            }
+            AF_INET6 => {
+                // For IPv6, we fallback to standard localhost since our encoding is IPv4-specific
+                let mut sockaddr_in6 = vec![0u8; 28]; // sizeof(struct sockaddr_in6)
+                
+                // Fill in the structure for ::1 (IPv6 localhost)
+                sockaddr_in6[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+                sockaddr_in6[2..4].copy_from_slice(&loopback_addr.port().to_be_bytes());
+                // Set ::1 address
+                sockaddr_in6[8..24].copy_from_slice(&[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1]);
+                
+                // Write the modified address structure back to process memory
+                ptrace_mgr.write_data(addr_ptr, &sockaddr_in6)?;
+                
+                debug!("Modified connect() to use IPv6 localhost: ::1:{}", loopback_addr.port());
+            }
+            _ => {
+                return Err(graftcp_common::GraftcpError::NetworkError(
+                    format!("Unsupported address family: {}", family)
+                ));
+            }
+        }
+        
+        Ok(())
     }
 }

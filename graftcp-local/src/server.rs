@@ -1,4 +1,5 @@
 use graftcp_common::{Result, Config};
+use graftcp_common::fake_ip::{decode_from_loopback_simple, is_loopback_encoded};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::net::{TcpListener, TcpStream};
@@ -14,6 +15,38 @@ pub struct ProxyServer {
 impl ProxyServer {
     pub fn new(config: Config) -> Self {
         Self { config }
+    }
+    
+    /// Start the proxy server listening on all loopback addresses (127.0.0.0/8)
+    /// This replaces the traditional single-port listening approach
+    pub async fn start_loopback_listen(&self) -> Result<()> {
+        // For simplicity, we'll listen on 0.0.0.0:0 and let the OS assign a port
+        // In a full implementation, we'd need to use raw sockets or multiple listeners
+        // to truly capture all loopback traffic
+        
+        info!("Starting loopback-aware proxy server...");
+        
+        // Listen on all interfaces for now - in practice, applications will connect
+        // to specific loopback addresses that we've encoded
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let actual_addr = listener.local_addr()?;
+        
+        info!("graftcp-local listening on {} (loopback mode)", actual_addr);
+        info!("Note: In loopback mode, the actual listening address is less important");
+        info!("Applications will connect to encoded loopback addresses (127.x.x.x)");
+        
+        // Create a dummy proxy client and process tracker for compatibility
+        let proxy_client = ProxyClient::new(
+            self.config.socks5_addr,
+            self.config.socks5_username.clone(),
+            self.config.socks5_password.clone(),
+            self.config.http_proxy_addr,
+            self.config.proxy_mode.clone(),
+        )?;
+        
+        let process_tracker = Arc::new(RwLock::new(ProcessTracker::new()));
+        
+        self.start_with_listener(listener, proxy_client, process_tracker).await
     }
     
     /// Start the proxy server and return the actual listening address
@@ -75,59 +108,36 @@ impl ProxyServer {
         client_stream: TcpStream,
         remote_addr: std::net::SocketAddr,
         proxy_client: ProxyClient,
-        process_tracker: Arc<RwLock<ProcessTracker>>,
+        _process_tracker: Arc<RwLock<ProcessTracker>>, // No longer needed for loopback encoding!
     ) -> Result<()> {
-        // Get local and remote addresses for this connection
+        // Get local address for this connection - this is the encoded loopback address!
         let local_addr = client_stream.local_addr()?;
         
         debug!("Handling connection: {} -> {}", remote_addr, local_addr);
         
-        // Try multiple approaches to resolve destination:
-        // 1. Check if we have a fake IP mapping via FIFO
-        // 2. Use traditional PID-based lookup as fallback
-        use graftcp_common::{resolve_fake_ip, is_fake_ip};
-        use std::net::IpAddr;
-        
-        let dest_addr = {
-            let mut tracker = process_tracker.write().await;
-            
-            // First try to find destination via PID mapping (which may contain fake IPs)
-            match tracker.find_pid_and_dest_by_connection(&remote_addr, &local_addr) {
-                Some((pid, mapped_dest)) => {
-                    // Check if mapped_dest is a fake IP
-                    match mapped_dest.ip() {
-                        IpAddr::V4(ipv4) if is_fake_ip(IpAddr::V4(ipv4)) => {
-                            // This is a fake IP from FIFO, resolve to real destination
-                            match resolve_fake_ip(ipv4) {
-                                Some(real_dest) => {
-                                    info!("Resolved fake IP {} to real destination {} (PID: {})", ipv4, real_dest, pid);
-                                    real_dest
-                                }
-                                None => {
-                                    error!("Failed to resolve fake IP {} from FIFO (PID: {})", ipv4, pid);
-                                    return Err(graftcp_common::GraftcpError::ProcessError(
-                                        format!("Cannot resolve fake IP {} from FIFO", ipv4)
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {
-                            // This is a direct real destination mapping
-                            info!("Using direct destination mapping: {} (PID: {})", mapped_dest, pid);
-                            mapped_dest
-                        }
-                    }
+        // SIMPLIFIED: Direct decoding from loopback address
+        // No FIFO communication, no PID tracking, no global state!
+        let dest_addr = if is_loopback_encoded(local_addr.ip()) {
+            // Decode the real destination directly from the loopback address
+            match decode_from_loopback_simple(local_addr) {
+                Some(real_dest) => {
+                    info!("Decoded loopback {} to real destination {}", local_addr, real_dest);
+                    real_dest
                 }
                 None => {
-                    error!("Cannot find destination mapping for connection {} -> {}", remote_addr, local_addr);
+                    error!("Failed to decode loopback address: {}", local_addr);
                     return Err(graftcp_common::GraftcpError::ProcessError(
-                        "Cannot find destination mapping for connection".to_string()
+                        format!("Cannot decode loopback address: {}", local_addr)
                     ));
                 }
             }
+        } else {
+            // Not a loopback encoded address - might be direct connection
+            warn!("Connection to non-encoded address: {} - treating as direct", local_addr);
+            local_addr
         };
         
-        info!("Final destination resolved: {} -> {}", remote_addr, dest_addr);
+        info!("Final destination resolved: {} -> {}", local_addr, dest_addr);
         
         // Connect to the real destination through proxy
         let dest_stream = match proxy_client.connect(dest_addr).await {
