@@ -1,37 +1,35 @@
 # graftcp-rust
 
-Rust implementation of [graftcp](https://github.com/hmgle/graftcp) - a flexible tool that redirects TCP connections made by any given program to SOCKS5 or HTTP proxy.
+A Rust implementation of [graftcp](https://github.com/hmgle/graftcp) - a flexible tool that redirects TCP connections made by any given program to a SOCKS5 or HTTP proxy.
 
-## Status
-
-🚧 **Work in Progress** - This is an early stage Rust port of the original C/Go implementation. Many core features are not yet implemented.
+This version consolidates all functionality into a single, efficient binary (`mgraftcp`).
 
 ## Architecture
 
 This project consists of three main components:
 
-- **graftcp-common** - Shared types, error handling, and configuration.
-- **graftcp** - A library that uses ptrace to intercept and redirect connections.
-- **graftcp-local** - A library that provides the local proxy server to forward connections.
-- **mgraftcp** - The main binary that combines the tracer and proxy functionality.
+- **graftcp-common**: A shared library for common data structures, configuration, and error handling.
+- **graftcp**: A library that uses Linux's `ptrace` API to intercept `connect()` system calls from a target program.
+- **graftcp-local**: A library providing a local proxy server that forwards the intercepted connections to a user-configured SOCKS5 or HTTP proxy.
+- **mgraftcp**: The main binary that combines the tracer and proxy functionality into a single executable.
 
 ## Building
 
 ### Prerequisites
 
 - Rust 1.70 or later
-- Linux (ptrace functionality is Linux-specific)
+- A Linux-based operating system (due to the use of ptrace)
 
 ### Build Commands
 
 ```bash
-# Build the mgraftcp binary
+# Build the mgraftcp binary in release mode
 make build
 
-# Development build
+# Development build (debug mode)
 make dev
 
-# Install system-wide
+# Install the binary to /usr/local/bin
 sudo make install
 ```
 
@@ -41,69 +39,58 @@ sudo make install
 # Format code
 make fmt
 
-# Run lints
+# Run clippy lints
 make clippy
 
 # Run tests
 make test
 
-# All development checks
+# Run all development checks
 make dev-check
 ```
 
 ## Usage
 
-**Note: The Rust implementation is not yet functional. Refer to the original C/Go implementation for working software.**
+`mgraftcp` runs a target program while intercepting its TCP connections and redirecting them through a SOCKS5 proxy (defaults to `127.0.0.1:1080`).
 
 ```bash
-# Use mgraftcp to redirect a program's connections through a proxy
-./target/release/mgraftcp curl https://example.com
+# Redirect connections from `wget` through the default SOCKS5 proxy
+RUST_LOG=info ./target/release/mgraftcp wget https://example.com
+
+# Specify a different SOCKS5 proxy
+RUST_LOG=info ./target/release/mgraftcp --socks5 192.168.1.100:1080 curl -v http://ifconfig.me
 ```
-
-## Configuration
-
-Configuration files are searched in this order:
-
-1. Command line `--config` argument
-2. `$(executable_dir)/graftcp-local.conf`
-3. `$XDG_CONFIG_HOME/graftcp-local/graftcp-local.conf`
-4. `$HOME/.config/graftcp-local/graftcp-local.conf`  
-5. `/etc/graftcp-local/graftcp-local.conf`
-
-See `example-graftcp-local.conf` for configuration format.
 
 ## Implementation Status
 
 ### Completed
-- [x] Project structure and build system
-- [x] Basic CLI argument parsing
-- [x] Configuration system
-- [x] Error handling framework
+- [x] **Project Structure**: Consolidated into a single `mgraftcp` binary with library components.
+- [x] **Configuration**: Basic CLI argument parsing for proxy settings.
+- [x] **Ptrace Interception**: Core `connect()` syscall interception using a double-hook mechanism.
+- [x] **Dynamic IP Allocation**: Allocates unique loopback IPs (`127.0.0.x`) to track different destination addresses.
+- [x] **SOCKS5 Proxy Client**: Support for SOCKS5 with and without username/password authentication.
+- [x] **Connection Forwarding**: Data is relayed bidirectionally between the client and the real destination.
 
 ### In Progress
-- [ ] ptrace functionality for syscall interception
-- [ ] SOCKS5/HTTP proxy client implementation
-- [ ] Connection forwarding and data relay
-- [ ] FIFO communication between components
+- [ ] **HTTP Proxy Client**: Basic HTTP CONNECT support is implemented but needs more robust error handling and header parsing.
+- [ ] **FIFO Communication**: The mechanism for communication between the tracer and the local proxy is in place but not fully utilized for advanced tracking.
+- [ ] **IP Filtering**: Blacklist/whitelist functionality is planned but not yet implemented.
 
 ### TODO
-- [ ] Memory and register manipulation for ptrace
-- [ ] Platform-specific syscall handling (x86_64, ARM, etc.)
-- [ ] IP blacklist/whitelist filtering
-- [ ] Complete test coverage
-- [ ] Performance optimization
-- [ ] Documentation
+- [ ] **SECCOMP BPF**: Add seccomp-bpf filters to reduce ptrace overhead by only trapping necessary syscalls (e.g., `connect`, `socket`, `close`), which will significantly improve performance.
+- [ ] **Configuration Files**: Implement loading configuration from standard file locations.
+- [ ] **Platform Support**: Improve platform-specific syscall handling (e.g., for ARM architectures).
+- [ ] **Test Coverage**: Increase test coverage for proxy clients and ptrace logic.
+- [ ] **Documentation**: Add more detailed in-code and user documentation.
+- [ ] **Performance Optimization**: Further profiling and optimization of data relay and ptrace handling.
 
 ## Contributing
 
-This is a complex systems programming project requiring deep knowledge of:
+Contributions are welcome, especially for the core ptrace and performance optimization areas. This is a complex systems programming project requiring knowledge of:
 
-- Linux ptrace system calls
-- Network programming and proxy protocols
-- Cross-platform system call interfaces
-- Memory-safe systems programming in Rust
-
-Contributions are welcome, especially for the core ptrace functionality.
+- Linux `ptrace` and `seccomp` system calls
+- Asynchronous network programming in Rust
+- Proxy protocols (SOCKS5, HTTP)
 
 ## License
 
@@ -112,3 +99,5 @@ GNU General Public License v3.0 - same as the original graftcp project.
 ## Acknowledgments
 
 Based on the original [graftcp](https://github.com/hmgle/graftcp) by Hmgle and contributors.
+
+Inspired by tools like `proxychains`, `tsocks`, and `redsocks`.
