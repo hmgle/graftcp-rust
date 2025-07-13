@@ -1,0 +1,49 @@
+[workspace]
+members = [
+    "graftcp",
+    "graftcp-local", 
+    "graftcp-common",
+    "mgraftcp"
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.5.0"
+authors = ["graftcp-rust contributors"]
+license = "GPL-3.0"
+edition = "2021"
+rust-version = "1.70"
+repository = "https://github.com/hmgle/graftcp"
+description = "A flexible tool that can redirect the TCP connection made by the given program to SOCKS5 or HTTP proxy"
+
+[workspace.dependencies]
+# System/ptrace dependencies
+nix = { version = "0.27", features = ["process", "ptrace", "signal", "socket", "fs"] }
+libc = "0.2"
+
+# Async networking
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Network protocols
+socks = "0.3"
+
+# CLI and config
+clap = { version = "4.4", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utilities
+bytes = "1.5"
+uuid = { version = "1.6", features = ["v4"] }
+glob = "0.3"
+rand = "0.8"
+tempfile = "3.8"

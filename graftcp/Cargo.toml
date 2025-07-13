@@ -1,0 +1,42 @@
+[package]
+name = "graftcp"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Main graftcp binary for process tracing and connection redirection"
+
+[[bin]]
+name = "graftcp"
+path = "src/main.rs"
+
+[lib]
+name = "graftcp"
+path = "src/lib.rs"
+
+[dependencies]
+graftcp-common = { path = "../graftcp-common" }
+
+# System calls and process control
+nix.workspace = true
+libc.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Config and serialization
+serde.workspace = true
+toml.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Utilities
+uuid.workspace = true
