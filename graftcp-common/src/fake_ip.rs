@@ -21,6 +21,12 @@ const LOOPBACK_MASK: u32 = 0xFF000000; // /8 mask
 const LOOPBACK_START: u32 = 0x7F000001; // 127.0.0.1 (skip 127.0.0.0)
 const LOOPBACK_END: u32 = 0x7FFFFFFE;   // 127.255.255.254 (skip 127.255.255.255)
 
+impl Default for LoopbackGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopbackGenerator {
     pub fn new() -> Self {
         Self {
@@ -44,9 +50,9 @@ impl LoopbackGenerator {
             let loopback_ip = Ipv4Addr::from(self.current_ip);
             
             // Check if this IP is already in use
-            if !self.loopback_to_target.contains_key(&loopback_ip) {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.loopback_to_target.entry(loopback_ip) {
                 // Found an available IP
-                self.loopback_to_target.insert(loopback_ip, target);
+                e.insert(target);
                 self.target_to_loopback.insert(target, loopback_ip);
                 
                 // Advance to next IP for future allocations
@@ -105,14 +111,13 @@ impl LoopbackGenerator {
     }
 }
 
-/// Global instance of the loopback generator
+// Global instance of the loopback generator
 lazy_static! {
     pub static ref GLOBAL_LOOPBACK_GENERATOR: Arc<Mutex<LoopbackGenerator>> = 
         Arc::new(Mutex::new(LoopbackGenerator::new()));
 }
 
 /// Convenience functions for global access
-
 /// Allocate a loopback IP for a target address
 pub fn allocate_loopback_ip(target: SocketAddr) -> Result<Ipv4Addr, String> {
     GLOBAL_LOOPBACK_GENERATOR

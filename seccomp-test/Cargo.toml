@@ -1,0 +1,31 @@
+[package]
+name = "seccomp-test"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Test program for seccomp BPF + ptrace integration"
+
+[[bin]]
+name = "simple_test"
+path = "src/simple_test.rs"
+
+[[bin]]
+name = "seccomp-test"
+path = "src/main.rs"
+
+[dependencies]
+# System/ptrace dependencies
+nix = { workspace = true }
+libc = { workspace = true }
+
+# Seccomp dependencies
+libseccomp = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }

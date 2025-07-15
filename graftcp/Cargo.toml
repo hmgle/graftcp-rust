@@ -37,9 +37,5 @@ tracing-subscriber.workspace = true
 # Utilities
 uuid.workspace = true
 
-# Seccomp BPF filtering (optional)
-seccompiler = { workspace = true, optional = true }
-
-[features]
-default = ["seccomp"]
-seccomp = ["dep:seccompiler"]
+# Seccomp BPF support  
+libseccomp = { workspace = true }

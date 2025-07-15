@@ -38,7 +38,7 @@ pub struct Args {
     pub http_proxy: Option<String>,
     
     /// SOCKS5 proxy address
-    #[arg(long = "socks5", default_value = "127.0.0.1:1080")]
+    #[arg(long = "socks5", default_value = "127.0.0.1:1081")]
     pub socks5: String,
     
     /// SOCKS5 username
@@ -52,10 +52,6 @@ pub struct Args {
     /// Proxy selection mode
     #[arg(long = "select_proxy_mode", default_value = "auto")]
     pub select_proxy_mode: String,
-    
-    /// Show version information
-    #[arg(long = "version")]
-    pub version: bool,
     
     /// Program to execute
     pub program: Option<String>,
@@ -105,11 +101,6 @@ impl Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    
-    if args.version {
-        println!("mgraftcp version {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
     
     // Initialize tracing
     if args.enable_debug_log {
