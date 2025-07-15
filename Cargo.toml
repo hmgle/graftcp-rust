@@ -3,7 +3,8 @@ members = [
     "graftcp",
     "graftcp-local", 
     "graftcp-common",
-    "mgraftcp"
+    "mgraftcp",
+    "seccomp-test"
 ]
 resolver = "2"
 
@@ -48,5 +49,6 @@ glob = "0.3"
 rand = "0.8"
 tempfile = "3.8"
 
-# Seccomp BPF filtering
+# Seccomp BPF dependencies  
 seccompiler = "0.4"
+libseccomp = "0.4"

@@ -61,14 +61,13 @@ impl PtraceManager {
             WaitStatus::Stopped(_, _) => {
                 debug!("Process {} stopped successfully", self.target_pid);
                 
-                // Set ptrace options for tracing
+                // Set ptrace options for tracing (without PTRACE_O_TRACESYSGOOD)
                 ptrace::setoptions(
                     self.target_pid,
                     ptrace::Options::PTRACE_O_TRACECLONE
                         | ptrace::Options::PTRACE_O_TRACEEXEC
                         | ptrace::Options::PTRACE_O_TRACEFORK
-                        | ptrace::Options::PTRACE_O_TRACEVFORK
-                        | ptrace::Options::PTRACE_O_TRACESYSGOOD,
+                        | ptrace::Options::PTRACE_O_TRACEVFORK,
                 )?;
                 
                 Ok(())
@@ -266,6 +265,52 @@ impl PtraceManager {
         }
     }
     
+    /// Set a single syscall argument
+    pub fn set_syscall_arg(&self, arg_index: usize, value: u64) -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if arg_index >= 6 {
+                return Err(graftcp_common::GraftcpError::PtraceError(
+                    format!("Invalid syscall argument index: {}", arg_index)
+                ));
+            }
+            
+            let reg_offsets = [
+                x86_64_regs::RDI,
+                x86_64_regs::RSI,
+                x86_64_regs::RDX,
+                x86_64_regs::R10,
+                x86_64_regs::R8,
+                x86_64_regs::R9,
+            ];
+            
+            unsafe {
+                ptrace::write(
+                    self.target_pid,
+                    reg_offsets[arg_index] as *mut _,
+                    value as *mut _,
+                )?;
+            }
+            
+            Ok(())
+        }
+        
+        #[cfg(target_arch = "aarch64")]
+        {
+            error!("ARM64 single syscall argument modification not implemented yet");
+            Err(graftcp_common::GraftcpError::PtraceError(
+                "ARM64 syscall arg modification not implemented".to_string()
+            ))
+        }
+        
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Err(graftcp_common::GraftcpError::PtraceError(
+                "Unsupported architecture for syscall arg modification".to_string()
+            ))
+        }
+    }
+    
     /// Get return value of system call
     pub fn get_retval(&self) -> Result<i64> {
         #[cfg(target_arch = "x86_64")]
@@ -432,24 +477,28 @@ impl PtraceManager {
     }
     
     /// Check if this is a connect() system call
+    /// Note: With seccomp filtering, this is mainly used for fallback scenarios
     pub fn is_connect_syscall(&self) -> Result<bool> {
         let syscall_num = self.get_syscall_number()?;
         Ok(syscall_num == syscalls::SYS_CONNECT)
     }
     
     /// Check if this is a socket() system call
+    /// Note: With seccomp filtering, this is mainly used for fallback scenarios
     pub fn is_socket_syscall(&self) -> Result<bool> {
         let syscall_num = self.get_syscall_number()?;
         Ok(syscall_num == syscalls::SYS_SOCKET)
     }
     
     /// Check if this is a close() system call
+    /// Note: With seccomp filtering, this is mainly used for fallback scenarios
     pub fn is_close_syscall(&self) -> Result<bool> {
         let syscall_num = self.get_syscall_number()?;
         Ok(syscall_num == syscalls::SYS_CLOSE)
     }
     
     /// Check if this is a clone() system call
+    /// Note: With seccomp filtering, this is mainly used for fallback scenarios
     pub fn is_clone_syscall(&self) -> Result<bool> {
         let syscall_num = self.get_syscall_number()?;
         Ok(syscall_num == syscalls::SYS_CLONE)

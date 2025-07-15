@@ -23,18 +23,14 @@ pub struct ProcessInfo {
 
 /// Configuration for proxy selection modes
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ProxyMode {
+    #[default]
     Auto,
     Random,
     OnlySocks5,
     OnlyHttpProxy,
     Direct,
-}
-
-impl Default for ProxyMode {
-    fn default() -> Self {
-        ProxyMode::Auto
-    }
 }
 
 /// Configuration structure

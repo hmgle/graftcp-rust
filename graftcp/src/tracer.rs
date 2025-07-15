@@ -1,5 +1,4 @@
 use crate::ptrace::PtraceManager;
-use crate::seccomp;
 
 use graftcp_common::{Result, ProcessInfo, SocketInfo};
 use graftcp_common::{allocate_loopback_ip, is_loopback_ip};
@@ -29,6 +28,8 @@ pub struct Tracer {
     /// Storage for original connect() arguments during syscall hook
     /// Key: PID, Value: (original_addr_ptr, original_addr_data, allocated_loopback_ip)
     pending_connects: HashMap<u32, (u64, Vec<u8>, Ipv4Addr)>,
+    /// Track pending socket fd updates for seccomp events
+    pending_socket_for_fd_update: HashMap<u32, bool>,
 }
 
 impl Tracer {
@@ -40,13 +41,13 @@ impl Tracer {
             local_port,
             ignore_local,
             pending_connects: HashMap::new(),
+            pending_socket_for_fd_update: HashMap::new(),
         }
     }
     
     /// Start tracing a program with given arguments
     pub fn start_trace(&mut self, program: &str, args: &[String]) -> Result<()> {
         info!("Starting to trace program: {} with args: {:?}", program, args);
-        info!("Seccomp status: {}", seccomp::get_filter_description());
         
         // Fork to create child process
         match unsafe { fork() }? {
@@ -55,19 +56,18 @@ impl Tracer {
                 self.trace_child(child)
             }
             ForkResult::Child => {
-                // Child process: enable tracing and exec
-                debug!("Child process: enabling ptrace and executing program");
+                // Child process: install seccomp filter, enable tracing and exec
+                debug!("Child process: installing seccomp, enabling ptrace and executing program");
+                
+                // Install seccomp BPF filter BEFORE enabling ptrace
+                // This ensures we only get traced for the syscalls we care about
+                if let Err(e) = crate::seccomp::install_seccomp_filter() {
+                    error!("Failed to install seccomp filter: {}", e);
+                    std::process::exit(1);
+                }
                 
                 // Allow parent to trace this process
                 ptrace::traceme()?;
-                
-                // Install seccomp filter AFTER ptrace setup but BEFORE exec
-                // This ensures the filter applies to the target program
-                if let Err(e) = seccomp::install_seccomp_filter() {
-                    error!("Failed to install seccomp filter: {}", e);
-                    // Continue without seccomp - will use pure ptrace mode
-                    warn!("Continuing with pure ptrace mode (reduced performance)");
-                }
                 
                 // Induce a ptrace stop like the C version does
                 // This ensures the parent can set up tracing before we exec
@@ -111,32 +111,19 @@ impl Tracer {
             WaitStatus::Stopped(_, _) => {
                 debug!("Child process {} stopped initially", child_pid);
                 
-                // Set ptrace options - include TRACESECCOMP if seccomp is enabled
-                let mut options = ptrace::Options::PTRACE_O_TRACECLONE
-                    | ptrace::Options::PTRACE_O_TRACEEXEC
-                    | ptrace::Options::PTRACE_O_TRACEFORK
-                    | ptrace::Options::PTRACE_O_TRACEVFORK
-                    | ptrace::Options::PTRACE_O_TRACESYSGOOD;
+                // Set ptrace options - only seccomp tracing for syscalls
+                ptrace::setoptions(
+                    child_pid,
+                    ptrace::Options::PTRACE_O_TRACECLONE
+                        | ptrace::Options::PTRACE_O_TRACEEXEC
+                        | ptrace::Options::PTRACE_O_TRACEFORK
+                        | ptrace::Options::PTRACE_O_TRACEVFORK
+                        | ptrace::Options::PTRACE_O_TRACESECCOMP, // Enable seccomp event tracing
+                )?;
                 
-                // Enable seccomp event tracing if seccomp is available
-                if seccomp::is_seccomp_enabled() {
-                    options |= ptrace::Options::PTRACE_O_TRACESECCOMP;
-                    debug!("Enabled PTRACE_O_TRACESECCOMP for seccomp BPF events");
-                }
-                
-                ptrace::setoptions(child_pid, options)?;
-                
-                // Start syscall tracing
-                if seccomp::is_seccomp_enabled() {
-                    // With seccomp, we can use PTRACE_CONT initially
-                    // seccomp will generate events for syscalls we need to intercept
-                    ptrace::cont(child_pid, None)?;
-                    debug!("Started with PTRACE_CONT (seccomp will generate events)");
-                } else {
-                    // Without seccomp, fall back to traditional PTRACE_SYSCALL
-                    ptrace::syscall(child_pid, None)?;
-                    debug!("Started with PTRACE_SYSCALL (pure ptrace mode)");
-                }
+                // Start with PTRACE_CONT instead of PTRACE_SYSCALL when using seccomp
+                // The seccomp filter will generate events for the syscalls we care about
+                ptrace::cont(child_pid, None)?;
             }
             status => {
                 error!("Unexpected initial status: {:?}", status);
@@ -155,7 +142,9 @@ impl Tracer {
         });
         
         // Main tracing loop
+        info!("🚀 Starting main ptrace loop for PID {}", child_pid);
         loop {
+            debug!("⏳ Waiting for events from PID {}", child_pid);
             match nix::sys::wait::waitpid(child_pid, None)? {
                 WaitStatus::Exited(pid, exit_code) => {
                     info!("Process {} exited with code {}", pid, exit_code);
@@ -170,38 +159,59 @@ impl Tracer {
                 WaitStatus::Stopped(pid, signal) => {
                     debug!("Process {} stopped with signal {:?}", pid, signal);
                     
-                    // Check if this is a syscall stop (SIGTRAP | 0x80)
+                    // With seccomp filtering, we should rarely get SIGTRAP for syscalls
+                    // Most syscalls are handled via PTRACE_EVENT_SECCOMP
                     if signal == nix::sys::signal::Signal::SIGTRAP {
-                        // Handle syscall entry/exit (traditional ptrace mode)
+                        debug!("Unexpected SIGTRAP for PID {} - using fallback syscall handling", pid);
                         let ptrace_mgr = PtraceManager::new(pid);
                         self.handle_syscall(&ptrace_mgr, pid.as_raw() as u32)?;
+                    } else {
+                        debug!("Non-SIGTRAP signal: {:?} for PID {}", signal, pid);
                     }
                     
                     // Continue execution
-                    self.continue_tracing(pid)?;
+                    ptrace::cont(pid, None)?;
                 }
                 WaitStatus::PtraceEvent(pid, _, event) => {
-                    debug!("Process {} ptrace event: {}", pid, event);
+                    debug!("Process {} ptrace event: {} (0x{:x})", pid, event, event);
                     
-                    // Check for seccomp event (PTRACE_EVENT_SECCOMP = 7)
-                    if event == 7 && seccomp::is_seccomp_enabled() {
-                        debug!("Seccomp event detected for PID {}", pid);
-                        let ptrace_mgr = PtraceManager::new(pid);
-                        self.handle_seccomp_event(&ptrace_mgr, pid.as_raw() as u32)?;
+                    // Check if this is a seccomp event - this is our primary syscall handling path
+                    if event == libc::PTRACE_EVENT_SECCOMP {
+                        info!("🔥 SECCOMP event for PID {}", pid);
+                        if let Some(trace_data) = crate::seccomp::get_seccomp_trace_data(pid) {
+                            let syscall_name = crate::seccomp::trace_data_to_syscall_name(trace_data);
+                            info!("🎯 Seccomp intercepted {} syscall (trace_data={})", syscall_name, trace_data);
+                            
+                            let ptrace_mgr = PtraceManager::new(pid);
+                            self.handle_seccomp_syscall(&ptrace_mgr, pid.as_raw() as u32, trace_data)?;
+                        } else {
+                            warn!("⚠️  Seccomp event but failed to get trace data for PID {}", pid);
+                        }
                     } else {
-                        // Handle other events (clone, fork, exec) - just continue
-                        self.continue_tracing(pid)?;
+                        // Handle process lifecycle events (clone, fork, exec, etc.)
+                        debug!("Process lifecycle event: {} (0x{:x}) for pid {}", event, event, pid);
+                        
+                        match event {
+                            libc::PTRACE_EVENT_FORK => debug!("   → PTRACE_EVENT_FORK"),
+                            libc::PTRACE_EVENT_VFORK => debug!("   → PTRACE_EVENT_VFORK"),
+                            libc::PTRACE_EVENT_CLONE => debug!("   → PTRACE_EVENT_CLONE"),
+                            libc::PTRACE_EVENT_EXEC => debug!("   → PTRACE_EVENT_EXEC"),
+                            libc::PTRACE_EVENT_VFORK_DONE => debug!("   → PTRACE_EVENT_VFORK_DONE"),
+                            libc::PTRACE_EVENT_EXIT => debug!("   → PTRACE_EVENT_EXIT"),
+                            _ => debug!("   → Unknown event type: {}", event),
+                        }
                     }
+                    
+                    ptrace::cont(pid, None)?;
                 }
                 WaitStatus::PtraceSyscall(pid) => {
-                    debug!("Process {} syscall stop", pid);
-                    let ptrace_mgr = PtraceManager::new(pid);
-                    self.handle_syscall(&ptrace_mgr, pid.as_raw() as u32)?;
-                    self.continue_tracing(pid)?;
+                    // This should not happen with seccomp filtering enabled
+                    warn!("Unexpected PtraceSyscall event for PID {} - seccomp should handle syscalls", pid);
+                    ptrace::cont(pid, None)?;
                 }
                 status => {
                     debug!("Unhandled wait status: {:?}", status);
-                    self.continue_tracing(child_pid)?;
+                    ptrace::cont(child_pid, None)?;
                 }
             }
         }
@@ -209,131 +219,120 @@ impl Tracer {
         Ok(())
     }
     
-    /// Choose appropriate continuation method based on seccomp status
-    fn continue_tracing(&self, pid: Pid) -> Result<()> {
-        if seccomp::is_seccomp_enabled() {
-            // With seccomp, use PTRACE_CONT for normal execution
-            // seccomp events will interrupt when needed
-            ptrace::cont(pid, None)?;
-        } else {
-            // Without seccomp, use PTRACE_SYSCALL to trap every syscall
-            ptrace::syscall(pid, None)?;
-        }
-        Ok(())
-    }
-    
-    /// Handle seccomp BPF events (when seccomp filter matches)
-    fn handle_seccomp_event(&mut self, ptrace_mgr: &PtraceManager, pid: u32) -> Result<()> {
-        debug!("Handling seccomp event for PID {}", pid);
+    /// Handle seccomp-triggered syscall events
+    /// This is called when seccomp BPF filter triggers a SECCOMP_RET_TRACE for specific syscalls
+    fn handle_seccomp_syscall(&mut self, ptrace_mgr: &PtraceManager, pid: u32, trace_data: u64) -> Result<()> {
+        info!("📋 Handling seccomp syscall for PID {} with trace_data {}", pid, trace_data);
         
-        // For seccomp events, we're always at syscall entry
-        // The BPF filter has already determined this is a syscall we care about
-        match ptrace_mgr.get_syscall_number() {
-            Ok(syscall_num) => {
-                debug!("Seccomp trapped syscall: {}", syscall_num);
+        match trace_data {
+            1 => {
+                // socket() syscall
+                info!("🔌 Handling socket() syscall via seccomp for PID {}", pid);
                 
-                // Check specific syscalls (same logic as traditional ptrace)
-                if ptrace_mgr.is_connect_syscall().unwrap_or(false) {
-                    debug!("Seccomp: Intercepting connect() syscall for PID {}", pid);
-                    if let Err(e) = self.handle_connect_syscall(ptrace_mgr, pid) {
-                        warn!("Failed to handle connect syscall: {}", e);
+                // Log syscall arguments for debugging
+                if let Ok(domain) = ptrace_mgr.get_syscall_arg(0) {
+                    if let Ok(socket_type) = ptrace_mgr.get_syscall_arg(1) {
+                        if let Ok(protocol) = ptrace_mgr.get_syscall_arg(2) {
+                            info!("   → socket({}, {}, {}) called by PID {}", domain, socket_type, protocol, pid);
+                        }
                     }
-                } else if ptrace_mgr.is_socket_syscall().unwrap_or(false) {
-                    debug!("Seccomp: Tracking socket() syscall for PID {}", pid);
-                    if let Err(e) = self.handle_socket_syscall(ptrace_mgr, pid) {
-                        warn!("Failed to handle socket syscall: {}", e);
+                }
+                
+                // Handle socket syscall entry (tracking) - only for TCP sockets
+                if let Err(e) = self.handle_socket_syscall(ptrace_mgr, pid) {
+                    warn!("Failed to handle socket syscall: {}", e);
+                }
+                
+                // For seccomp, we need to also handle socket return value
+                // We'll use a simple approach: assume socket() succeeds and track the fd
+                // when we see the next syscall or event from this process
+                self.pending_socket_for_fd_update.insert(pid, true);
+            }
+            2 => {
+                // connect() syscall  
+                info!("🌐 Handling connect() syscall via seccomp for PID {}", pid);
+                
+                // Log syscall arguments for debugging
+                if let Ok(sockfd) = ptrace_mgr.get_syscall_arg(0) {
+                    if let Ok(addr_ptr) = ptrace_mgr.get_syscall_arg(1) {
+                        if let Ok(addrlen) = ptrace_mgr.get_syscall_arg(2) {
+                            info!("   → connect({}, 0x{:x}, {}) called by PID {}", sockfd, addr_ptr, addrlen, pid);
+                        }
                     }
-                } else if ptrace_mgr.is_close_syscall().unwrap_or(false) {
-                    debug!("Seccomp: Tracking close() syscall for PID {}", pid);
-                    if let Err(e) = self.handle_close_syscall(ptrace_mgr, pid) {
-                        warn!("Failed to handle close syscall: {}", e);
+                }
+                
+                if let Err(e) = self.handle_connect_syscall(ptrace_mgr, pid) {
+                    warn!("Failed to handle connect syscall: {}", e);
+                }
+            }
+            3 => {
+                // close() syscall
+                info!("❌ Handling close() syscall via seccomp for PID {}", pid);
+                
+                // Log syscall arguments for debugging
+                if let Ok(fd) = ptrace_mgr.get_syscall_arg(0) {
+                    info!("   → close({}) called by PID {}", fd, pid);
+                }
+                
+                if let Err(e) = self.handle_close_syscall(ptrace_mgr, pid) {
+                    warn!("Failed to handle close syscall: {}", e);
+                }
+            }
+            4 => {
+                // clone() syscall (x86_64 only)
+                #[cfg(target_arch = "x86_64")]
+                {
+                    info!("👥 Handling clone() syscall via seccomp for PID {}", pid);
+                    
+                    // Log syscall arguments for debugging
+                    if let Ok(flags) = ptrace_mgr.get_syscall_arg(0) {
+                        info!("   → clone(0x{:x}) called by PID {}", flags, pid);
                     }
-                } else if ptrace_mgr.is_clone_syscall().unwrap_or(false) {
-                    debug!("Seccomp: Handling clone() syscall for PID {}", pid);
+                    
                     if let Err(e) = self.handle_clone_syscall(ptrace_mgr, pid) {
                         warn!("Failed to handle clone syscall: {}", e);
                     }
                 }
             }
-            Err(e) => {
-                debug!("Failed to read syscall number in seccomp event: {}", e);
+            _ => {
+                warn!("❓ Unknown seccomp trace data: {}", trace_data);
             }
         }
         
-        // After handling the syscall entry, we need to continue and wait for exit
-        // Use PTRACE_SYSCALL to get the syscall exit event
-        ptrace::syscall(Pid::from_raw(pid as i32), None)?;
-        
+        info!("✅ Completed handling seccomp syscall {} for PID {}", trace_data, pid);
         Ok(())
     }
     
-    /// Handle system call entry/exit
+    /// Handle system call entry/exit - simplified for seccomp-only mode
+    /// This is only used as a fallback when seccomp filtering fails
     fn handle_syscall(&mut self, ptrace_mgr: &PtraceManager, pid: u32) -> Result<()> {
+        // With seccomp filtering, this function is only called as a fallback
+        // Most syscalls should be handled by handle_seccomp_syscall instead
+        warn!("Fallback syscall handling triggered for PID {} - this should be rare with seccomp", pid);
+        
+        // Only handle syscall exits for socket() to get return values
+        // when seccomp couldn't handle it properly
         let process_info = self.process_info.get_mut(&pid);
         if process_info.is_none() {
             debug!("Process {} not found in tracking", pid);
             return Ok(());
         }
         
-        // Determine if this is syscall entry or exit
         let is_syscall_entry = process_info.unwrap().flags & 0x1 == 0;
         
         if is_syscall_entry {
-            // Syscall entry - check if we need to intercept
-            
-            // Try to get syscall number, but don't fail if we can't
-            match ptrace_mgr.get_syscall_number() {
-                Ok(syscall_num) => {
-                    // Only log network-related syscalls to reduce spam
-                    if syscall_num == 41 || syscall_num == 42 || syscall_num == 3 { // socket, connect, close
-                        debug!("Syscall entry: {}", syscall_num);
-                    }
-                    
-                    // Check specific syscalls
-                    if ptrace_mgr.is_connect_syscall().unwrap_or(false) {
-                        debug!("Intercepting connect() syscall for PID {}", pid);
-                        if let Err(e) = self.handle_connect_syscall(ptrace_mgr, pid) {
-                            warn!("Failed to handle connect syscall: {}", e);
-                        }
-                    } else if ptrace_mgr.is_socket_syscall().unwrap_or(false) {
-                        debug!("Tracking socket() syscall for PID {}", pid);
-                        if let Err(e) = self.handle_socket_syscall(ptrace_mgr, pid) {
-                            warn!("Failed to handle socket syscall: {}", e);
-                        }
-                    } else if ptrace_mgr.is_close_syscall().unwrap_or(false) {
-                        debug!("Tracking close() syscall for PID {}", pid);
-                        if let Err(e) = self.handle_close_syscall(ptrace_mgr, pid) {
-                            warn!("Failed to handle close syscall: {}", e);
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Don't spam the logs with syscall read errors
-                    // Most syscalls will fail to read due to timing/permissions
-                }
-            }
-            
-            // Update flags to indicate we're in syscall
+            // Set flag to indicate we're in syscall
             if let Some(proc_info) = self.process_info.get_mut(&pid) {
                 proc_info.flags |= 0x1;
             }
         } else {
-            // Syscall exit - handle socket() return value and connect() restoration
-            match ptrace_mgr.get_syscall_number() {
-                Ok(_) => {
-                    if ptrace_mgr.is_socket_syscall().unwrap_or(false) {
-                        if let Err(e) = self.handle_socket_syscall_exit(ptrace_mgr, pid) {
-                            warn!("Failed to handle socket syscall exit: {}", e);
-                        }
-                    } else if ptrace_mgr.is_connect_syscall().unwrap_or(false) {
-                        // Restore original connect() arguments after syscall completes
-                        if let Err(e) = self.handle_connect_syscall_exit(ptrace_mgr, pid) {
-                            warn!("Failed to handle connect syscall exit: {}", e);
-                        }
+            // Syscall exit - only handle socket() return value as fallback
+            if let Ok(syscall_num) = ptrace_mgr.get_syscall_number() {
+                if syscall_num == 41 { // SYS_SOCKET
+                    debug!("Fallback: handling socket() syscall exit for PID {}", pid);
+                    if let Err(e) = self.handle_socket_syscall_exit(ptrace_mgr, pid) {
+                        warn!("Failed to handle socket syscall exit: {}", e);
                     }
-                }
-                Err(_) => {
-                    // Ignore errors reading syscall number on exit
                 }
             }
             
@@ -358,9 +357,27 @@ impl Tracer {
         
         // Check if this socket was tracked as a TCP socket
         let socket_key = ((sockfd as u64) << 31) + (pid as u64);
+        
+        // For seccomp, we might have a pending socket that hasn't been properly keyed yet
         if !self.socket_info.contains_key(&socket_key) {
-            debug!("Socket fd {} not tracked as TCP socket, ignoring connect", sockfd);
-            return Ok(());
+            // Check if this PID has a pending TCP socket that we need to associate with this fd
+            if self.pending_socket_for_fd_update.contains_key(&pid) {
+                let magic_fd = (graftcp_common::MAGIC_FD << 31) + (pid as u64);
+                if let Some(mut socket_info) = self.socket_info.remove(&magic_fd) {
+                    debug!("Updating pending TCP socket for PID {} with fd {}", pid, sockfd);
+                    socket_info.fd = sockfd;
+                    socket_info.magic_fd = socket_key;
+                    self.socket_info.insert(socket_key, socket_info);
+                    self.pending_socket_for_fd_update.remove(&pid);
+                    info!("=== NEW CONNECTION === Successfully associated TCP socket fd {} with PID {}", sockfd, pid);
+                } else {
+                    debug!("Socket fd {} not tracked as TCP socket, ignoring connect", sockfd);
+                    return Ok(());
+                }
+            } else {
+                debug!("Socket fd {} not tracked as TCP socket, ignoring connect", sockfd);
+                return Ok(());
+            }
         }
         
         // Read the socket address from traced process memory
@@ -599,18 +616,22 @@ impl Tracer {
         if (domain == AF_INET || domain == AF_INET6) && (socket_type & SOCK_STREAM) != 0 {
             debug!("Tracking TCP socket for PID {}", pid);
             
-            // Create socket info with temporary magic_fd, similar to C implementation
+            // For seccomp, we can't easily get the return value, so we use a different approach
+            // We'll store the socket info and update it when we see connect()
             let socket_info = SocketInfo {
                 pid,
-                fd: -1, // Will be set when socket() returns
+                fd: -1, // Will be determined when connect() is called
                 magic_fd: (graftcp_common::MAGIC_FD << 31) + (pid as u64),
                 domain,
                 socket_type,
                 connect_time: std::time::SystemTime::now(),
             };
             
-            // Store with magic_fd key for now
+            // Store with magic_fd key for now, we'll re-key it in connect()
             self.socket_info.insert(socket_info.magic_fd, socket_info);
+            
+            // Mark this PID as having a pending TCP socket
+            self.pending_socket_for_fd_update.insert(pid, true);
         }
         
         Ok(())
@@ -667,41 +688,40 @@ impl Tracer {
         if let Some(_socket_info) = self.socket_info.remove(&socket_key) {
             debug!("Removed socket tracking for fd {} (pid {})", fd, pid);
             
-            // Note: The C version adds a delay here, but in our async implementation
-            // we should avoid blocking the ptrace loop. The delay was meant to prevent
-            // premature connection closure, but our double-hook mechanism should handle this.
+            // Add delay similar to C implementation to prevent premature connection closure
+            use std::time::Duration;
+            std::thread::sleep(Duration::from_millis(500)); // MIN_CLOSE_MSEC equivalent
         }
         
         Ok(())
     }
     
-    /// Handle clone() system call (x86_64 only)
-    fn handle_clone_syscall(&mut self, ptrace_mgr: &PtraceManager, pid: u32) -> Result<()> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Get clone flags
-            let flags = ptrace_mgr.get_syscall_arg(0)?;
-            debug!("clone() called with flags: 0x{:x}", flags);
+    /// Handle clone() system call - remove CLONE_UNTRACED flag
+    /// This matches the behavior from the C implementation  
+    #[cfg(target_arch = "x86_64")]
+    fn handle_clone_syscall(&mut self, ptrace_mgr: &PtraceManager, _pid: u32) -> Result<()> {
+        // Get clone flags from first argument
+        let flags = ptrace_mgr.get_syscall_arg(0)? as u64;
+        debug!("clone() called: original flags=0x{:x}", flags);
+        
+        // Remove CLONE_UNTRACED flag (0x00800000)
+        const CLONE_UNTRACED: u64 = 0x00800000;
+        let new_flags = flags & !CLONE_UNTRACED;
+        
+        if flags != new_flags {
+            debug!("Removing CLONE_UNTRACED flag: 0x{:x} -> 0x{:x}", flags, new_flags);
             
-            // Remove CLONE_UNTRACED flag if present (similar to C implementation)
-            const CLONE_UNTRACED: u64 = 0x00800000;
-            if flags & CLONE_UNTRACED != 0 {
-                let new_flags = flags & !CLONE_UNTRACED;
-                debug!("Removing CLONE_UNTRACED flag: 0x{:x} -> 0x{:x}", flags, new_flags);
-                
-                // Modify the flags argument in the child's registers
-                // This requires writing to RDI register (first argument on x86_64)
-                if let Err(e) = ptrace_mgr.set_syscall_args(&[new_flags, 0, 0, 0, 0, 0]) {
-                    warn!("Failed to modify clone flags: {}", e);
-                }
-            }
+            // Write back the modified flags to RDI register (first argument)
+            // This matches the C implementation: ptrace(PTRACE_POKEUSER, pid, sizeof(long) * RDI, flags)
+            ptrace_mgr.set_syscall_arg(0, new_flags)?;
         }
         
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            debug!("clone() handling not implemented for this architecture");
-        }
-        
+        Ok(())
+    }
+    
+    #[cfg(not(target_arch = "x86_64"))]
+    fn handle_clone_syscall(&mut self, _ptrace_mgr: &PtraceManager, _pid: u32) -> Result<()> {
+        debug!("clone() syscall handling not implemented for this architecture");
         Ok(())
     }
     
@@ -801,6 +821,13 @@ impl Tracer {
             }
         }
         
+        Ok(())
+    }
+    
+    /// Switch to syscall tracing for a specific socket() call to get return value
+    fn switch_to_syscall_tracing(&mut self, pid: nix::unistd::Pid) -> Result<()> {
+        // Use PTRACE_SYSCALL to catch the syscall exit and get return value
+        ptrace::syscall(pid, None)?;
         Ok(())
     }
 }
